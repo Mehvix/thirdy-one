@@ -1,6 +1,9 @@
 from typing import List, Tuple
-import random
 from tqdm import tqdm, trange
+import os, csv, random  # noqa: E401
+
+# from numpy import argmax
+import argparse
 
 
 """
@@ -21,9 +24,32 @@ Greedy startegy:
 * Drop lowest value card always
 """
 
+parser = argparse.ArgumentParser(description="Simulate 31, the card game")
 
-def all_but_idx(lst, idx):
+parser.add_argument("--player_cnt", type=int, default=3, help="Number of players")
+parser.add_argument("--hero_id", type=int, default=0, help="Hero ID")  # todo randomize
+parser.add_argument("--threshold", type=int, default=22, help="Threshold value")
+parser.add_argument("--samples", type=int, default=int(1e2), help="Number of samples")
+
+args = parser.parse_args()
+
+PLAYER_CNT = args.player_cnt
+HERO_ID = args.hero_id
+THRESHOLD = args.threshold
+SAMPLES = args.samples
+
+assert 1 < PLAYER_CNT
+assert 0 <= HERO_ID < PLAYER_CNT
+assert 0 < THRESHOLD < 31
+assert 0 < SAMPLES
+
+
+def all_but_idx(lst: list, idx: int) -> list:
     return lst[:idx] + lst[idx + 1 :]
+
+
+def argmax(lst: list):
+    return max(range(len(lst)), key=lambda i: lst[i])
 
 
 class Card:
@@ -64,8 +90,10 @@ class Deck:
 
     def draw(self) -> Card:
         if self.size() == 0:
-            self.cards, self.pile = self.pile, []
+            self.cards = self.pile
+            self.pile = []
             self.shuffle()
+            assert self.size() == 52 - 3 * PLAYER_CNT - 1
         return self.cards.pop()
 
     def size(self) -> int:
@@ -87,7 +115,6 @@ class Player:
     def hand_value(self, hand: list[Card] = None) -> int:
         c1, c2, c3 = hand or self.hand
 
-        # this could be refactored to show decision tree; ensuring we handle all cases
         if c1.suit == c2.suit == c3.suit:
             return c1.val + c2.val + c3.val
         elif c1.suit == c2.suit:
@@ -130,13 +157,14 @@ class Player:
         card = card or self.deck.discard
         val, hand, disc = self.hand_value(), self.hand, card
 
-        # ! bad -- ties broken arbitarily !
         for i in range(len(self.hand)):
             test_hand = [card] + all_but_idx(self.hand, i)
-            # test_hand = [card] + self.hand[i + 1 :] + self.hand[:i]
-            if (test_val := self.hand_value(test_hand)) > val:
+            test_val = self.hand_value(test_hand)
+            test_disc = self.hand[i]
+            if test_val > val or (test_val == val and test_disc.val < disc.val):
                 val, hand = test_val, test_hand
-                disc = self.hand[i]
+                disc = test_disc
+
         return val, hand, disc
 
     @property
@@ -146,7 +174,7 @@ class Player:
     def turn(self):
         assert not self.is_over  # (we are so back)
         hv, hs = self.hand_value_suited()
-        is_hero = self.id == HERO
+        is_hero = self.id == HERO_ID
 
         if is_hero:
             if hv >= THRESHOLD:
@@ -160,53 +188,93 @@ class Player:
             # ! this is maybe bad? i.e. we could drop a 10 and take a 2 if it's suited w a 9
             # we should def take if it surpasses our threhold
             if (is_hero and d_val > THRESHOLD) or (d_val - SWAP_DELTA > hv):
+                # print("take discard")
                 self.hand, self.deck.discard = d_hand, d_disc
                 return
 
+        # !!! SOFT LOCK HERE !!! we may have value >12 but same suit as another player; never swap suits when committed. this should be okay for aggro hero but not for regulars (?)
         new_card = self.deck.draw()
+
+        self.deck.pile.append(self.deck.discard)
+        self.deck.discard = None
+
         n_val, n_hand, n_disc = self.best_value_given_card(new_card)
         if n_val > hv:
+            # print("take new card")
+            self.hand, self.deck.discard = n_hand, n_disc
             # todo we may feed our op 7/8/9/face if we draw a suited low card
-            self.hand, self.deck.discard, n_hand, n_disc
-            self.deck.pile.append(new_card)
-            return
+        else:
+            # print("discard new card")
+            self.deck.discard = new_card
 
-        self.deck.discard = new_card
+        assert self.deck.size() + len(self.deck.pile) == 52 - 3 * PLAYER_CNT - 1
+
         return
 
 
+class Statistics:
+    def __init__(self) -> None:
+        self.entries = []
+        self.records_folder = "records"
+        if not os.path.exists(self.records_folder):
+            os.makedirs(self.records_folder)
+
+    def update(self, players_arr: list[Player]):
+        entry = dict(
+            winner=argmax([p.hand_value() for p in players_arr]),
+            turns=len(self.entries) + 1,
+        )
+
+        for i, player in enumerate(players_arr):
+            entry[f"{i}_hand"] = str(player.hand)
+            entry[f"{i}_val"] = player.hand_value()
+
+        self.entries.append(entry)
+
+    def dump(self):
+        if not self.entries:
+            print("No data to export.")
+            return
+
+        file_number = 0
+        fname = None
+        while os.path.exists(
+            fname := os.path.join(self.records_folder, f"{file_number}.csv")
+        ):
+            file_number += 1
+            # and they say you cannot do-while in py
+
+        with open(fname, "w", newline="") as fout:
+            writer = csv.DictWriter(fout, fieldnames=list(self.entries[0].keys()))
+            writer.writeheader()
+            for entry in self.entries:
+                writer.writerow(entry)
+        print(f"Data exported to {fname}")
+
+
 if __name__ == "__main__":
-    PLAYERS = 3
-    HERO = 0  # compare w randomization
-    THRESHOLD = 22
-
-    deck = Deck()
-    # print(deck)
-    players = [Player(deck) for _ in range(PLAYERS)]
-    assert deck.size() == 52 - 3 * PLAYERS - 1
-
     # for _ in trange(100000):
     #     pa = Player(Deck())
     #     # print(pa.hand, pa.hand_value_suited())
     #     assert pa.hand_value() == pa.hand_value_suited()[0]
+    stats = Statistics()
 
-    active = 0
-    turns = 0
+    for itr in trange(SAMPLES):  # todo parallelize
+        deck = Deck()
+        # print(deck)
+        players_arr = [Player(deck) for _ in range(PLAYER_CNT)]
+        assert deck.size() == 52 - 3 * PLAYER_CNT - 1
 
-    while True:
-        pa = players[active]
+        active = 0
+        turns = 0
 
-        if pa.is_over:
-            pv = pa.hand_value()
-            if pv == 31 or pv > (
-                better := max([op.hand_value() for op in all_but_idx(players, active)])
-            ):
-                print(f"{active} won after {turns} with {pv}")
-                # todo print stats
-            else:
-                print(f"{active} was beat  after {turns} with {pv} to {better}")
-            break
-        pa.turn()
+        while (pa := players_arr[active]) and not pa.is_over:
+            assert deck.size() + len(deck.pile) == 52 - 3 * PLAYER_CNT - 1
 
-        active = (active + 1) % PLAYERS
-        turns += 1
+            pa.turn()
+            turns += 1
+
+            active = (active + 1) % PLAYER_CNT
+
+        stats.update(players_arr)
+    stats.dump()
